@@ -1,3 +1,5 @@
+This is a pedagogical, barebones event loop and I/O library for Python, demonstrating how to build `async/await`-friendly socket servers using only Linux's io_uring -- with zero dependence on epoll, select, or Python's built-in `asyncio` machinery.
+
 If liburing is not already installed:
 ```
 sudo apt-get update
