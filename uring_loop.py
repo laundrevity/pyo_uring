@@ -7,12 +7,7 @@ lib.uring_init.argtypes = [ctypes.c_uint]
 lib.uring_exit.restype = None
 lib.uring_submit_recv.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint, ctypes.c_ulong]
 lib.uring_submit_send.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint, ctypes.c_ulong]
-lib.uring_submit_accept.argtypes = [
-    ctypes.c_int,
-    ctypes.c_void_p,
-    ctypes.c_void_p,
-    ctypes.c_ulong,
-]
+lib.uring_submit_accept.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
 lib.uring_wait_cqe.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong)]
 lib.uring_init(64)
 
