@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <stdio.h>
 
@@ -49,6 +50,14 @@ int uring_submit_accept(int fd, struct sockaddr *addr, socklen_t *addrlen, unsig
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     if (!sqe) return -1;
     io_uring_prep_accept(sqe, fd, addr, addrlen, 0);
+    io_uring_sqe_set_data64(sqe, user_data);
+    return io_uring_submit(&ring);
+}
+
+int uring_submit_connect(int fd, struct sockaddr *addr, socklen_t addrlen, unsigned long user_data) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    if (!sqe) return -1;
+    io_uring_prep_connect(sqe, fd, addr, addrlen);
     io_uring_sqe_set_data64(sqe, user_data);
     return io_uring_submit(&ring);
 }
