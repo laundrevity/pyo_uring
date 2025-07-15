@@ -9,11 +9,11 @@ sudo apt-get install liburing-dev
 In first window:
 ```
 gcc shared -fPIC uring_helper.c -luring -o liburing_helper.so
-python uring_loop.py
+python server.py
 ```
 
 In n-th other window:
 ```
-nc localhost 43210
+python client.py
 hello fron $n$
 ```
