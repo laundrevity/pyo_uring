@@ -9,12 +9,18 @@ lib = ctypes.CDLL(os.path.join(os.path.dirname(os.path.abspath(__file__)), "libu
 lib.uring_init.argtypes = [ctypes.c_uint]
 lib.uring_init.restype = ctypes.c_int
 lib.uring_exit.restype = None
-lib.uring_submit_recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulong]
-lib.uring_submit_send.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulong]
-lib.uring_submit_accept.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
-lib.uring_submit_connect.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong]
-lib.uring_submit_timeout.argtypes = [ctypes.c_longlong, ctypes.c_ulong]
-lib.uring_wait_cqe.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong)]
+lib.uring_prep_recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulonglong]
+lib.uring_prep_send.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulonglong]
+lib.uring_prep_accept.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulonglong]
+lib.uring_prep_connect.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_ulonglong]
+lib.uring_prep_timeout.argtypes = [ctypes.c_void_p, ctypes.c_ulonglong]
+lib.uring_wait.argtypes = [ctypes.c_longlong, ctypes.POINTER(ctypes.c_int),
+                           ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_int]
+lib.uring_wait.restype = ctypes.c_int
+
+
+class KernelTimespec(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_longlong), ("tv_nsec", ctypes.c_longlong)]
 
 
 # Helper for sockaddr_in
@@ -92,8 +98,8 @@ class Loop:
     _current = None
     _current_lock = threading.Lock()
 
-    def __init__(self):
-        ret = lib.uring_init(64)
+    def __init__(self, entries=256, busy_poll=0.0):
+        ret = lib.uring_init(entries)
         if ret < 0:
             hint = {
                 errno.ENOSYS: "Blocked by seccomp (Podman: --security-opt seccomp=unconfined), "
@@ -105,6 +111,10 @@ class Loop:
             raise OSError(-ret, f"io_uring setup failed: {os.strerror(-ret)}. {hint}")
         self._waiters = {}
         self._user_data_counter = 1
+        # Seconds to poll for completions before sleeping in the kernel.
+        self.busy_poll = busy_poll
+        self._res = (ctypes.c_int * entries)()
+        self._ud = (ctypes.c_ulonglong * entries)()
 
     def run(self, coro):
         with Loop._current_lock:
@@ -112,12 +122,21 @@ class Loop:
             try:
                 Task(coro)
                 # Every pending operation, including sleeps, is an io_uring
-                # request, so the loop just waits for the next completion.
+                # request, so the loop just waits for completions. Each pass
+                # submits everything queued since the last pass and collects
+                # every completion that's ready, in at most one system call.
+                res, ud, max_n = self._res, self._ud, len(self._res)
+                spin_ns = int(self.busy_poll * 1e9)
+                wait, handle = lib.uring_wait, self.handle_cqe
                 while self._waiters:
-                    res = ctypes.c_int()
-                    ud = ctypes.c_ulong()
-                    lib.uring_wait_cqe(ctypes.byref(res), ctypes.byref(ud))
-                    self.handle_cqe(res.value, ud.value)
+                    n = wait(spin_ns, res, ud, max_n)
+                    if n == 1:  # the usual case; indexing beats slicing here
+                        handle(res[0], ud[0])
+                    elif n > 1:
+                        for r, u in zip(res[:n], ud[:n]):
+                            handle(r, u)
+                    elif n < 0:
+                        raise OSError(-n, f"io_uring wait failed: {os.strerror(-n)}")
             finally:
                 lib.uring_exit()
                 Loop._current = None
@@ -131,8 +150,9 @@ class Loop:
         ud = self._user_data_counter
         self._user_data_counter += 1
         self._waiters[ud] = fut
-        ret = lib.uring_submit_recv(fd, buf, len(buf), ud)
+        ret = lib.uring_prep_recv(fd, buf, len(buf), ud)
         if ret < 0:
+            del self._waiters[ud]
             fut.set_result(ret)
         return fut
 
@@ -141,8 +161,9 @@ class Loop:
         ud = self._user_data_counter
         self._user_data_counter += 1
         self._waiters[ud] = fut
-        ret = lib.uring_submit_send(fd, buf, len(buf), ud)
+        ret = lib.uring_prep_send(fd, buf, len(buf), ud)
         if ret < 0:
+            del self._waiters[ud]
             fut.set_result(ret)
         return fut
 
@@ -153,9 +174,10 @@ class Loop:
         addr = ctypes.create_string_buffer(128)
         addrlen = ctypes.c_int(ctypes.sizeof(addr))
         self._waiters[ud] = (fut, addr, addrlen)
-        ret = lib.uring_submit_accept(fd, addr, ctypes.byref(addrlen), ud)
+        ret = lib.uring_prep_accept(fd, addr, ctypes.byref(addrlen), ud)
         if ret < 0:
-            fut.set_result(ret)
+            del self._waiters[ud]
+            fut.set_result((ret, b""))
         return fut
 
     def submit_connect(self, fd, sockaddr, addrlen):
@@ -163,8 +185,9 @@ class Loop:
         ud = self._user_data_counter
         self._user_data_counter += 1
         self._waiters[ud] = fut
-        ret = lib.uring_submit_connect(fd, sockaddr, addrlen, ud)
+        ret = lib.uring_prep_connect(fd, sockaddr, addrlen, ud)
         if ret < 0:
+            del self._waiters[ud]
             fut.set_result(ret)
         return fut
 
@@ -181,14 +204,25 @@ class Loop:
         ud = self._user_data_counter
         self._user_data_counter += 1
         self._waiters[ud] = fut
-        ret = lib.uring_submit_timeout(max(0, int(delay * 1e9)), ud)
+        ns = max(0, int(delay * 1e9))
+        # The kernel reads the timespec when the loop submits the request,
+        # after this returns, so the future keeps it alive.
+        fut.timespec = KernelTimespec(ns // 1_000_000_000, ns % 1_000_000_000)
+        ret = lib.uring_prep_timeout(ctypes.byref(fut.timespec), ud)
         if ret < 0:
+            del self._waiters[ud]
             fut.set_result(ret)
         return fut
 
 
-def run(coro):
-    loop = Loop()
+def run(coro, busy_poll=0.0):
+    """Run coro to completion.
+
+    busy_poll: seconds to keep checking for completions before sleeping in the
+    kernel. Checking is a memory read, not a system call, so polling avoids
+    the cost of waking a sleeping process, at the price of a busy CPU.
+    """
+    loop = Loop(busy_poll=busy_poll)
     loop.run(coro)
 
 

@@ -2,3 +2,5 @@
 .idea
 .venv
 *.so
+results
+__pycache__

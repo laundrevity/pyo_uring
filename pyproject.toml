@@ -3,3 +3,7 @@ name = "pyo-uring"
 version = "0.1.0"
 requires-python = ">=3.15"
 dependencies = []
+
+[project.optional-dependencies]
+# Only for the Deribit benchmark in bench/.
+bench = ["websockets>=17"]
