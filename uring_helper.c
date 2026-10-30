@@ -10,8 +10,9 @@
 
 static struct io_uring ring;
 
-void uring_init(unsigned entries) {
-    io_uring_queue_init(entries, &ring, 0);
+// Returns 0 on success, -errno on error.
+int uring_init(unsigned entries) {
+    return io_uring_queue_init(entries, &ring, 0);
 }
 
 void uring_exit() {
@@ -58,6 +59,17 @@ int uring_submit_connect(int fd, struct sockaddr *addr, socklen_t addrlen, unsig
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     if (!sqe) return -1;
     io_uring_prep_connect(sqe, fd, addr, addrlen);
+    io_uring_sqe_set_data64(sqe, user_data);
+    return io_uring_submit(&ring);
+}
+
+// Completes with res = -ETIME once `ns` nanoseconds have passed.
+int uring_submit_timeout(long long ns, unsigned long user_data) {
+    // The kernel copies ts during io_uring_submit, so a stack variable is fine.
+    struct __kernel_timespec ts = { .tv_sec = ns / 1000000000, .tv_nsec = ns % 1000000000 };
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+    if (!sqe) return -1;
+    io_uring_prep_timeout(sqe, &ts, 0, 0);
     io_uring_sqe_set_data64(sqe, user_data);
     return io_uring_submit(&ring);
 }

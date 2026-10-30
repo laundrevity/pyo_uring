@@ -1,16 +1,19 @@
 import ctypes
+import errno
+import os
 import socket
-import time
 import threading
 
 
-lib = ctypes.CDLL("./liburing_helper.so")
+lib = ctypes.CDLL(os.path.join(os.path.dirname(os.path.abspath(__file__)), "liburing_helper.so"))
 lib.uring_init.argtypes = [ctypes.c_uint]
+lib.uring_init.restype = ctypes.c_int
 lib.uring_exit.restype = None
 lib.uring_submit_recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulong]
 lib.uring_submit_send.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulong]
 lib.uring_submit_accept.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
 lib.uring_submit_connect.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong]
+lib.uring_submit_timeout.argtypes = [ctypes.c_longlong, ctypes.c_ulong]
 lib.uring_wait_cqe.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong)]
 
 
@@ -90,29 +93,27 @@ class Loop:
     _current_lock = threading.Lock()
 
     def __init__(self):
-        lib.uring_init(64)
+        ret = lib.uring_init(64)
+        if ret < 0:
+            hint = {
+                errno.ENOSYS: "Blocked by seccomp (Podman: --security-opt seccomp=unconfined), "
+                              "or the kernel lacks io_uring.",
+                errno.EACCES: "Blocked by SELinux (Podman: --security-opt label=disable).",
+                errno.EPERM: "Disabled by the kernel.io_uring_disabled sysctl, "
+                             "or blocked by Docker's seccomp profile.",
+            }.get(-ret, "")
+            raise OSError(-ret, f"io_uring setup failed: {os.strerror(-ret)}. {hint}")
         self._waiters = {}
         self._user_data_counter = 1
-        self._timers = []
 
     def run(self, coro):
         with Loop._current_lock:
             Loop._current = self
             try:
                 Task(coro)
-                while self._waiters or self._timers:
-                    now = time.monotonic()
-                    i = 0
-                    while i < len(self._timers):
-                        t, fut = self._timers[i]
-                        if now >= t:
-                            fut.set_result(None)
-                            self._timers.pop(i)
-                        else:
-                            i += 1
-                    if not self._waiters:
-                        # time.sleep(0.01)
-                        continue
+                # Every pending operation, including sleeps, is an io_uring
+                # request, so the loop just waits for the next completion.
+                while self._waiters:
                     res = ctypes.c_int()
                     ud = ctypes.c_ulong()
                     lib.uring_wait_cqe(ctypes.byref(res), ctypes.byref(ud))
@@ -177,7 +178,12 @@ class Loop:
 
     def sleep(self, delay):
         fut = Future()
-        self._timers.append((time.monotonic() + delay, fut))
+        ud = self._user_data_counter
+        self._user_data_counter += 1
+        self._waiters[ud] = fut
+        ret = lib.uring_submit_timeout(max(0, int(delay * 1e9)), ud)
+        if ret < 0:
+            fut.set_result(ret)
         return fut
 
 
